@@ -1,26 +1,35 @@
 /*
  * QEMU RISC-V G233 GPIO Controller
  *
+ * Modeled after hw/gpio/nrf51_gpio.c: all MMIO writes only update shadow
+ * registers, then g233_gpio_update_state() recomputes GPIO_IN readback,
+ * gpio_out[] pad drivers, GPIO_IS (edge sticky / level live), and PLIC IRQ.
+ *
+ * gpio_in[] levels follow nRF semantics: -1 = floating (not externally driven),
+ * 0/1 = driven. in_mask tracks which pins are driven from outside.
+ *
  * Copyright (c) 2026 G233 QEMU Camp
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "hw/core/sysbus.h"
+#include "hw/core/qdev.h"
 #include "hw/core/irq.h"
-#include "hw/core/qdev-properties.h"
-#include "qapi/error.h"
 #include "migration/vmstate.h"
 #include "trace.h"
 
 #define TYPE_G233_GPIO "g233.gpio"
 #define G233_GPIO(obj) OBJECT_CHECK(G233GPIOState, (obj), TYPE_G233_GPIO)
 
+#define G233_GPIO_LINES 32
+
 /* GPIO registers */
 #define GPIO_DIR    0x00  /* Direction register */
-#define GPIO_OUT    0x04  /* Output data register */
+#define GPIO_OUT    0x04  /* Output register */
 #define GPIO_IN     0x08  /* Input data register */
 #define GPIO_IE     0x0C  /* Interrupt enable */
 #define GPIO_IS     0x10  /* Interrupt status */
@@ -34,18 +43,124 @@ typedef struct G233GPIOState {
     /*< public >*/
     MemoryRegion iomem;
     qemu_irq irq;
+    qemu_irq output[G233_GPIO_LINES];
 
-    uint32_t dir;      /* Direction register */
-    uint32_t out;      /* Output register */
-    uint32_t last_level; /* Previous output level for edge detection */
-    uint32_t ie;       /* Interrupt enable */
-    uint32_t is;       /* Interrupt status */
-    uint32_t trig;     /* Trigger type */
-    uint32_t pol;      /* Polarity */
-    bool irq_cleared;   /* Flag to prevent re-triggering after IS clear */
+    /* MMIO shadow */
+    uint32_t dir;
+    uint32_t out;
+    uint32_t ie;
+    uint32_t is;
+    uint32_t trig;
+    uint32_t pol;
+
+    /*
+     * GPIO_IN readback (recomputed in update_state). Bits for output pins
+     * mirror OUT; for input pins, externally driven level or 0 if floating.
+     */
+    uint32_t in;
+    /* Per-pin: 1 if gpio_in line is driven (value >= 0), else floating */
+    uint32_t in_mask;
+
+    /* Previous pad levels for edge detect */
+    uint32_t old_level;
+    uint32_t old_out_drv;
+    uint32_t old_out_lvl;
 } G233GPIOState;
 
-static void gpio_update_interrupt(G233GPIOState *s);
+static void g233_gpio_update_state(G233GPIOState *s);
+
+static void g233_gpio_set(void *opaque, int line, int value)
+{
+    G233GPIOState *s = G233_GPIO(opaque);
+
+    assert(line >= 0 && line < G233_GPIO_LINES);
+
+    s->in_mask = deposit32(s->in_mask, line, 1, value >= 0);
+    if (value >= 0) {
+        s->in = deposit32(s->in, line, 1, value != 0);
+    }
+    g233_gpio_update_state(s);
+}
+
+/*
+ * Single nRF-style update: pad readback, gpio_out drivers, IS + IRQ.
+ * Edge-triggered IS is sticky (only W1C clears); level IS follows pad level.
+ */
+static void g233_gpio_update_state(G233GPIOState *s)
+{
+    uint32_t new_in = 0;
+    int i;
+
+    /* Pass 1: GPIO_IN readback + pad output drivers */
+    for (i = 0; i < G233_GPIO_LINES; i++) {
+        bool dir_out = extract32(s->dir, i, 1);
+        uint32_t in_bit;
+
+        if (dir_out) {
+            in_bit = extract32(s->out, i, 1);
+        } else if (extract32(s->in_mask, i, 1)) {
+            in_bit = extract32(s->in, i, 1);
+        } else {
+            in_bit = 0; /* floating input reads as 0 */
+        }
+        new_in = deposit32(new_in, i, 1, in_bit);
+
+        /* gpio_out: drive when output, tri-state when input */
+        {
+            bool drive = dir_out;
+            int level = drive ? (int)extract32(s->out, i, 1) : -1;
+            bool old_drive = extract32(s->old_out_drv, i, 1);
+            int old_lvl = extract32(s->old_out_lvl, i, 1);
+
+            if (old_drive != drive || (drive && old_lvl != (level & 1))) {
+                qemu_set_irq(s->output[i], level);
+            }
+            s->old_out_drv = deposit32(s->old_out_drv, i, 1, drive ? 1u : 0u);
+            s->old_out_lvl = deposit32(s->old_out_lvl, i, 1,
+                                       drive ? (uint32_t)(level & 1) : 0u);
+        }
+    }
+
+    s->in = new_in;
+
+    {
+        uint32_t changes = s->old_level ^ new_in;
+
+        for (i = 0; i < G233_GPIO_LINES; i++) {
+            if (!extract32(s->ie, i, 1)) {
+                continue;
+            }
+
+            bool edge_mode = !extract32(s->trig, i, 1);
+            bool rising_pol = extract32(s->pol, i, 1);
+            bool pin_changed = extract32(changes, i, 1);
+            bool pin_high = extract32(new_in, i, 1);
+            bool pin_low = !pin_high;
+
+            if (edge_mode) {
+                if (pin_changed) {
+                    if (rising_pol && pin_high) {
+                        s->is |= (1u << i);
+                    } else if (!rising_pol && pin_low) {
+                        s->is |= (1u << i);
+                    }
+                }
+            } else {
+                /* Level-triggered: live IS */
+                s->is &= ~(1u << i);
+                if (rising_pol && pin_high) {
+                    s->is |= (1u << i);
+                } else if (!rising_pol && pin_low) {
+                    s->is |= (1u << i);
+                }
+            }
+        }
+
+        s->old_level = new_in;
+    }
+
+    qemu_set_irq(s->irq, s->is != 0);
+}
 
 static uint64_t g233_gpio_read(void *opaque, hwaddr offset, unsigned size)
 {
@@ -60,8 +175,7 @@ static uint64_t g233_gpio_read(void *opaque, hwaddr offset, unsigned size)
         value = s->out;
         break;
     case GPIO_IN:
-        /* In output mode, read back the output latched value */
-        value = s->out;
+        value = s->in;
         break;
     case GPIO_IE:
         value = s->ie;
@@ -94,107 +208,35 @@ static void g233_gpio_write(void *opaque, hwaddr offset,
 
     switch (offset) {
     case GPIO_DIR:
-        s->dir = value;
-        gpio_update_interrupt(s);
+        s->dir = (uint32_t)value;
         break;
     case GPIO_OUT:
-        s->out = value;
-        gpio_update_interrupt(s);
+        s->out = (uint32_t)value;
         break;
     case GPIO_IN:
-        /* Read-only register */
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: write to read-only register 0x%" HWADDR_PRIx "\n",
-                      __func__, offset);
-        break;
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: write to read-only register 0x%"
+                      HWADDR_PRIx "\n", __func__, offset);
+        return;
     case GPIO_IE:
-        s->ie = value;
-        gpio_update_interrupt(s);
+        s->ie = (uint32_t)value;
         break;
     case GPIO_IS:
         /* Write-1-to-clear */
-        s->is &= ~value;
-        /* If all interrupts are cleared, lower IRQ line and prevent re-trigger */
-        if (s->is == 0) {
-            qemu_set_irq(s->irq, 0);
-            s->irq_cleared = true;
-        }
+        s->is &= ~(uint32_t)value;
         break;
     case GPIO_TRIG:
-        s->trig = value;
-        gpio_update_interrupt(s);
+        s->trig = (uint32_t)value;
         break;
     case GPIO_POL:
-        s->pol = value;
-        gpio_update_interrupt(s);
+        s->pol = (uint32_t)value;
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: bad offset 0x%" HWADDR_PRIx "\n",
                       __func__, offset);
-        break;
-    }
-}
-
-static void gpio_update_interrupt(G233GPIOState *s)
-{
-    uint32_t old_level = s->last_level;
-    uint32_t new_level = s->out;
-    uint32_t changes = old_level ^ new_level;
-
-    /* If we just cleared interrupts, don't re-trigger immediately.
-     * Update last_level to current level to prevent edge re-trigger. */
-    if (s->irq_cleared) {
-        s->irq_cleared = false;
-        s->last_level = new_level;  /* Sync to current level */
-        qemu_set_irq(s->irq, 0);    /* Ensure IRQ stays low */
         return;
     }
 
-    for (int i = 0; i < 32; i++) {
-        /* Skip if interrupt not enabled for this pin */
-        if (!((s->ie >> i) & 1)) {
-            continue;
-        }
-
-        /* Skip if pin is not configured as output */
-        if (!((s->dir >> i) & 1)) {
-            continue;
-        }
-
-        bool pin_changed = (changes >> i) & 1;
-        bool pin_high = (new_level >> i) & 1;
-        bool pin_low = !pin_high;
-        bool edge_triggered = !((s->trig >> i) & 1);
-        bool level_triggered = (s->trig >> i) & 1;
-        bool rising_polarity = (s->pol >> i) & 1;
-        bool falling_polarity = !rising_polarity;
-
-        /* Clear the interrupt status for this pin */
-        s->is &= ~(1 << i);
-
-        /* Edge-triggered mode */
-        if (edge_triggered && pin_changed) {
-            if (rising_polarity && pin_high) {
-                s->is |= (1 << i);  /* Rising edge detected */
-            } else if (falling_polarity && pin_low) {
-                s->is |= (1 << i);  /* Falling edge detected */
-            }
-        }
-
-        /* Level-triggered mode */
-        if (level_triggered) {
-            if (rising_polarity && pin_high) {
-                s->is |= (1 << i);  /* High level */
-            } else if (falling_polarity && pin_low) {
-                s->is |= (1 << i);  /* Low level */
-            }
-        }
-    }
-
-    /* Update last level */
-    s->last_level = new_level;
-
-    /* Trigger PLIC interrupt if any interrupt status is set */
-    qemu_set_irq(s->irq, (s->is != 0) ? 1 : 0);
+    g233_gpio_update_state(s);
 }
 
 static const MemoryRegionOps g233_gpio_ops = {
@@ -211,38 +253,49 @@ static void g233_gpio_reset(DeviceState *dev)
 
     s->dir = 0;
     s->out = 0;
-    s->last_level = 0;
     s->ie = 0;
     s->is = 0;
     s->trig = 0;
     s->pol = 0;
-    s->irq_cleared = false;
+    s->in = 0;
+    s->in_mask = 0;
+    s->old_level = 0;
+    s->old_out_drv = 0;
+    s->old_out_lvl = 0;
+
+    g233_gpio_update_state(s);
 }
 
-static void g233_gpio_realize(DeviceState *dev, Error **errp)
+static void g233_gpio_init(Object *obj)
 {
-    G233GPIOState *s = G233_GPIO(dev);
-    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
+    G233GPIOState *s = G233_GPIO(obj);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
-    memory_region_init_io(&s->iomem, OBJECT(s), &g233_gpio_ops, s,
+    memory_region_init_io(&s->iomem, obj, &g233_gpio_ops, s,
                           TYPE_G233_GPIO, 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->irq);
+
+    qdev_init_gpio_in(DEVICE(s), g233_gpio_set, G233_GPIO_LINES);
+    qdev_init_gpio_out(DEVICE(s), s->output, G233_GPIO_LINES);
 }
 
 static const VMStateDescription vmstate_g233_gpio = {
     .name = TYPE_G233_GPIO,
-    .version_id = 3,
-    .minimum_version_id = 3,
+    .version_id = 6,
+    .minimum_version_id = 6,
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(dir, G233GPIOState),
         VMSTATE_UINT32(out, G233GPIOState),
-        VMSTATE_UINT32(last_level, G233GPIOState),
+        VMSTATE_UINT32(in, G233GPIOState),
+        VMSTATE_UINT32(in_mask, G233GPIOState),
         VMSTATE_UINT32(ie, G233GPIOState),
         VMSTATE_UINT32(is, G233GPIOState),
         VMSTATE_UINT32(trig, G233GPIOState),
         VMSTATE_UINT32(pol, G233GPIOState),
-        VMSTATE_BOOL(irq_cleared, G233GPIOState),
+        VMSTATE_UINT32(old_level, G233GPIOState),
+        VMSTATE_UINT32(old_out_drv, G233GPIOState),
+        VMSTATE_UINT32(old_out_lvl, G233GPIOState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -251,7 +304,6 @@ static void g233_gpio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->realize = g233_gpio_realize;
     device_class_set_legacy_reset(dc, g233_gpio_reset);
     dc->vmsd = &vmstate_g233_gpio;
 }
@@ -260,6 +312,7 @@ static const TypeInfo g233_gpio_info = {
     .name          = TYPE_G233_GPIO,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(G233GPIOState),
+    .instance_init = g233_gpio_init,
     .class_init    = g233_gpio_class_init,
 };
 
