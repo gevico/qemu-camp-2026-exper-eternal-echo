@@ -1,0 +1,5 @@
+# See docs/devel/tracing.rst for syntax documentation.
+
+# g233_pwm.c
+g233_pwm_read(uint64_t offset, uint64_t value) "offset 0x%" PRIx64 " value 0x%" PRIx64
+g233_pwm_write(uint64_t offset, uint64_t value) "offset 0x%" PRIx64 " value 0x%" PRIx64

@@ -1,3 +1,7 @@
+# g233_spi.c
+g233_spi_read(uint64_t offset, uint64_t value) "offset 0x%" PRIx64 " value 0x%" PRIx64
+g233_spi_write(uint64_t offset, uint64_t value) "offset 0x%" PRIx64 " value 0x%" PRIx64
+
 # aspeed_smc.c
 
 aspeed_smc_flash_set_segment(int cs, uint64_t reg, uint64_t start, uint64_t end) "CS%d segreg=0x%"PRIx64" [ 0x%"PRIx64" - 0x%"PRIx64" ]"

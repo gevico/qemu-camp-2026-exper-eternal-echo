@@ -59,6 +59,7 @@
 #include "qapi/qapi-visit-common.h"
 #include "hw/virtio/virtio-iommu.h"
 #include "hw/uefi/var-service-api.h"
+#include "hw/gpio/g233_gpio.h"
 
 /* KVM AIA only supports APLIC MSI. APLIC Wired is always emulated by QEMU. */
 static bool g233_use_kvm_aia_aplic_imsic(RISCVG233AIAType aia_type)
@@ -1711,6 +1712,22 @@ static void virt_machine_init(MachineState *machine)
     pl011_create(s->memmap[VIRT_UART0].base,
                  qdev_get_gpio_in(mmio_irqchip, UART0_IRQ),
                  serial_hd(0));
+
+    /* G233 GPIO controller */
+    sysbus_create_simple("g233.gpio", 0x10012000,
+                         qdev_get_gpio_in(mmio_irqchip, 2));
+
+    /* G233 WDT (base 0x10010000, PLIC IRQ 4) */
+    sysbus_create_simple("g233.wdt", 0x10010000,
+                         qdev_get_gpio_in(mmio_irqchip, 4));
+
+    /* G233 PWM controller (test layout base 0x10015000, PLIC IRQ 3) */
+    sysbus_create_simple("g233.pwm", 0x10015000,
+                         qdev_get_gpio_in(mmio_irqchip, 3));
+
+    /* G233 SPI controller (base 0x10018000, PLIC IRQ 5) */
+    sysbus_create_simple("g233.spi", 0x10018000,
+                         qdev_get_gpio_in(mmio_irqchip, 5));
 
     sysbus_create_simple("goldfish_rtc", s->memmap[VIRT_RTC].base,
         qdev_get_gpio_in(mmio_irqchip, RTC_IRQ));
